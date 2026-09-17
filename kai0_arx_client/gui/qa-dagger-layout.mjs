@@ -1,0 +1,44 @@
+import {chromium,expect} from '@playwright/test';
+import assert from 'node:assert/strict';
+const browser=await chromium.launch({headless:true,executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+const page=await browser.newPage({viewport:{width:1504,height:1040}}),errors=[];
+let controlHeaders;page.on('request',r=>{if(r.url().endsWith('/api/heartbeat'))controlHeaders=r.headers()});
+page.on('pageerror',e=>errors.push(String(e)));
+const state=()=>page.evaluate(async()=>await(await fetch('/api/state')).json());
+const phase=async p=>page.waitForFunction(async p=>(await(await fetch('/api/state')).json()).dagger.phase===p,p,{timeout:20000});
+try{
+ await page.goto('http://127.0.0.1:8093');await page.getByText('页面服务在线',{exact:true}).waitFor();assert.equal((await state()).demo,true);
+ assert.equal(await page.locator('.storage-settings').count(),0);
+ await page.getByRole('button',{name:'DAgger 采集',exact:true}).click();
+ assert.equal(await page.locator('.storage-settings').evaluate(el=>el.open),false);
+ await page.getByText('保存路径与数据设置',{exact:true}).click();
+ const storage=(await state()).dagger.data_root;await page.getByRole('button',{name:'选择文件夹',exact:true}).click();await expect(page.getByRole('button',{name:'使用此文件夹',exact:true})).toBeEnabled();await page.getByRole('button',{name:'使用此文件夹',exact:true}).click();await expect.poll(async()=>(await state()).dagger.data_root).toBe(storage);
+ await page.getByText('保存路径与数据设置',{exact:true}).click();
+ await page.getByRole('button',{name:'控制台',exact:true}).click();
+ await page.getByRole('button',{name:'连接机械臂',exact:true}).click();await page.getByRole('button',{name:'确认执行'}).click();
+ await page.waitForFunction(async()=>(await(await fetch('/api/state')).json()).connected);
+ await page.getByRole('button',{name:'双臂归位',exact:true}).click();await page.waitForFunction(async()=>(await(await fetch('/api/state')).json()).mode==='holding');
+ await page.getByRole('button',{name:'连接相机',exact:true}).click();await page.waitForFunction(async()=>(await(await fetch('/api/state')).json()).cameras);
+ await page.getByRole('button',{name:'DAgger 采集',exact:true}).click();await page.locator('.task-settings summary').click();await page.getByLabel('每轮策略步数').fill('300');await page.locator('.task-settings summary').click();
+ await page.getByRole('button',{name:'开始试验并录制'}).click();await phase('policy');
+ await page.getByRole('button',{name:'人工接管 · 开始拖动'}).click();await phase('human');
+ const episode=(await state()).dagger.episode;
+ await page.waitForTimeout(1400);await page.screenshot({path:'design/dagger-human-desktop.png',fullPage:true});
+ await page.getByRole('button',{name:'控制台',exact:true}).click();await page.getByRole('button',{name:'DAgger 采集',exact:true}).click();assert.equal((await state()).dagger.episode,episode);
+ await page.getByRole('button',{name:'结束纠正并保持'}).click();await phase('paused');assert.equal((await state()).mode,'holding');
+ await page.getByRole('button',{name:'恢复 VLA',exact:true}).click();await phase('policy');await page.waitForTimeout(400);
+ await page.getByRole('button',{name:'人工接管 · 开始拖动'}).click();await phase('human');await page.waitForTimeout(700);
+ await page.getByRole('button',{name:'结束试验并保存'}).click();await phase('saved');
+ const saved=await state();assert(saved.dagger.samples>20);assert.equal(saved.mode,'holding');assert.equal(saved.dagger.interventions,2);
+ await page.waitForTimeout(2200);await page.getByRole('button').filter({hasText:episode}).click();
+ await page.locator('video').first().waitFor();await page.waitForFunction(()=>[...document.querySelectorAll('video')].every(v=>v.readyState>=1));
+ await page.locator('video').first().evaluate(v=>v.play());await page.waitForTimeout(400);assert(await page.locator('video').nth(1).evaluate(v=>!v.paused));
+ await page.screenshot({path:'design/dagger-saved-desktop.png',fullPage:true});
+ for(const width of [1280,1920,390]){await page.setViewportSize({width,height:900});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:`design/dagger-${width}.png`,fullPage:true});}
+ await page.evaluate(async headers=>{const r=await fetch('/api/action',{method:'POST',headers,body:JSON.stringify({action:'disconnect',confirmed:true})});if(!r.ok)throw Error(await r.text())},controlHeaders);
+ await page.waitForFunction(async()=>!(await(await fetch('/api/state')).json()).connected);
+ await page.evaluate(async({headers,episode})=>{const r=await fetch('/api/action',{method:'POST',headers,body:JSON.stringify({action:'dagger_export',episode})});if(!r.ok)throw Error(await r.text())},{headers:controlHeaders,episode});
+ await expect.poll(async()=>(await state()).dagger.task.status,{timeout:60000}).toBe('complete');
+ assert.equal((await state()).dagger.task.status,'complete',JSON.stringify((await state()).dagger.task));
+ assert.deepEqual(errors,[]);console.log(JSON.stringify({pass:true,episode,samples:saved.dagger.samples,interventions:2,errors}));
+}catch(e){console.log(JSON.stringify(await state()));await page.screenshot({path:'design/dagger-failed.png',fullPage:true});throw e;}finally{await browser.close()}

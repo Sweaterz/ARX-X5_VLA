@@ -1,0 +1,63 @@
+{
+  "server": {
+    "url": "ws://127.0.0.1:8001",
+    "timeout_s": 5.0
+  },
+  "robot": {
+    "model": "arx5_2025",
+    "units": "sdk_radians",
+    "sdk_path": "/absolute/path/to/ARX5_beta",
+    "left_can": "can1",
+    "right_can": "can3",
+    "urdf_path": "/absolute/path/to/X5-2025-gripper-handle-0p65kg.urdf"
+  },
+  "cameras": {
+    "serials": {
+      "head": "REPLACE_HEAD_SERIAL",
+      "left": "REPLACE_LEFT_SERIAL",
+      "right": "REPLACE_RIGHT_SERIAL"
+    }
+  },
+  "control": {
+    "fps": 30,
+    "actions_per_chunk": 8,
+    "prompt": "pick up the plate  on the ruck."
+  },
+  "safety": {
+    "watchdog_s": 2.0,
+    "max_observation_age_s": 1.5,
+    "lower": [
+      -1.57,
+      -0.1,
+      -0.1,
+      -1.29,
+      -1.48,
+      -1.74,
+      -3.4,
+      -1.57,
+      -0.1,
+      -0.1,
+      -1.29,
+      -1.48,
+      -1.74,
+      -3.4
+    ],
+    "upper": [
+      1.57,
+      3.6,
+      3.0,
+      1.29,
+      1.48,
+      1.74,
+      0.1,
+      1.57,
+      3.6,
+      3.0,
+      1.29,
+      1.48,
+      1.74,
+      0.1
+    ],
+    "limits_source": "Official software table: diagnostics only. Motion limits enforced by installed SDK."
+  }
+}

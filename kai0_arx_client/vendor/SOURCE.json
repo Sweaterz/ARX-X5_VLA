@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/OpenDriveLab/kai0",
+  "reference_commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
+  "retrieved": "2026-09-08",
+  "files": {
+    "image_tools.py": {
+      "upstream_path": "packages/openpi-client/src/openpi_client/image_tools.py",
+      "sha256": "d48b4bd7f44e79fe6db8a8e07c9161144fa250be686e1245014a8b47e6171977"
+    },
+    "msgpack_numpy.py": {
+      "upstream_path": "packages/openpi-client/src/openpi_client/msgpack_numpy.py",
+      "sha256": "c04568948fcee52b691e3be4b6cffb759f7e79ad67530fcd5d23095a0d13c057"
+    }
+  }
+}

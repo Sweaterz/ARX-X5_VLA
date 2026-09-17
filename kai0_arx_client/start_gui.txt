@@ -1,0 +1,2 @@
+cd ~/Documents/zhanghaoyi/kai0_arx_client
+./start_gui.sh

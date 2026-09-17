@@ -1,0 +1,11 @@
+{
+  "config.json": {"size": 2753, "sha256": "c26507bfdd34fbbc3bd6a041f10c6eb5948c9476139c0cb77d475fe34818fff4"},
+  "model.safetensors": {"size": 9354050784, "sha256": "445003fd9741fc79b8da76e66e4d41536fb657f32f53d7185be3540bfafea068"},
+  "policy_postprocessor.json": {"size": 780, "sha256": "03af86cc58ef3893701df4d2fe8cd9dbd333fddfb9c0b69c7642ea1a9d984b1d"},
+  "policy_postprocessor_step_0_unnormalizer_processor.safetensors": {"size": 9176, "sha256": "6d72b1d3289e8ae0dc55312277d1d55f370b13de81b482f353344be7a0928b90"},
+  "policy_preprocessor.json": {"size": 2152, "sha256": "2cb75d39497de65083e32357a355798ebd60f5144a39ef5db993ef050bf70b27"},
+  "policy_preprocessor_step_3_normalizer_processor.safetensors": {"size": 9192, "sha256": "ee7ca3b96bedea4c63bd45be68e20f754338750cccf21c88d0de3b5943f3b60d"},
+  "tokenizer/tokenizer.json": {"size": 34387384, "sha256": "7336bb4ce016bf8543de94e3a17c3d6ca502a6fc8628fec6ed88893639d7a296"},
+  "tokenizer/tokenizer_config.json": {"size": 503, "sha256": "247bcda99f6d66d445d620af53a340a1e2f665fbe8b659fbd5bce9e5ac688e77"},
+  "train_config.json": {"size": 8607, "sha256": "9d28ec6cd3b183c298bdfa76c45e11ae841bbadf893789fc12a3b8c2af1a4c70"}
+}

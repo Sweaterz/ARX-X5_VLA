@@ -1,0 +1,114 @@
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+import local_server as local
+import test_gui as fixtures
+
+
+class Tests(unittest.TestCase):
+    def test_missing_checkpoint_never_spawns(self):
+        server=local.LocalServer()
+        with tempfile.TemporaryDirectory() as root,patch.object(local,'SERVER_ROOT',Path(root)), \
+             patch.object(server,'health',side_effect=OSError('not running')),patch.object(local.subprocess,'Popen') as spawn:
+            server._run()
+            spawn.assert_not_called()
+            self.assertEqual(server.snapshot()['status'],'error')
+
+    def test_busy_port_never_spawns(self):
+        server=local.LocalServer()
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root)/'CHECKPOINT_VERIFIED.json').write_text('{}')
+            with patch.object(local,'SERVER_ROOT',Path(root)),patch.object(server,'health',side_effect=OSError()), \
+                 patch.object(local.socket,'socket') as sock,patch.object(server,'managed_pid',return_value=None),patch.object(local.subprocess,'Popen') as spawn:
+                sock.return_value.__enter__.return_value.bind.side_effect=OSError('in use')
+                server._run();spawn.assert_not_called()
+                self.assertIn('占用',server.snapshot()['message'])
+
+    def test_unrelated_health_is_not_accepted(self):
+        server=local.LocalServer()
+        response=io.BytesIO(json.dumps({'service':'unrelated'}).encode())
+        opener=Mock();opener.open.return_value=response
+        with patch.object(local.urllib.request,'build_opener',return_value=opener):
+            with self.assertRaisesRegex(RuntimeError,'不是预期'):server.health()
+
+    def test_no_duplicate_start_worker(self):
+        server=local.LocalServer();server.worker=Mock();server.worker.is_alive.return_value=True
+        with patch.object(local.threading,'Thread') as worker:
+            server.start();worker.assert_not_called()
+
+    def test_gui_refuses_model_load_while_robot_connected(self):
+        fixture=fixtures.GuiTests();fixture.setUp()
+        with self.assertRaisesRegex(ValueError,'断开机械臂'):
+            fixture.m.submit('server_start',{},'owner')
+        self.assertTrue(fixture.m.jobs.empty())
+
+    def test_gui_refuses_connect_during_model_load(self):
+        fixture=fixtures.GuiTests();fixture.setUp();m=fixture.m;m.robot=None;m.connected=False
+        m.local_server.update(status='starting')
+        with self.assertRaisesRegex(ValueError,'正在加载'):
+            m.submit('connect',{'confirmed':True},'owner')
+        self.assertTrue(m.jobs.empty())
+
+    def test_gui_start_server_does_not_initialize_robot(self):
+        fixture=fixtures.GuiTests();fixture.setUp();m=fixture.m;m.robot=None;m.connected=False
+        with patch.object(m.local_server,'start') as start,patch.object(fixtures.client,'SDKRobot') as sdk:
+            m.execute('server_start',{})
+            start.assert_called_once();sdk.assert_not_called()
+
+    def test_stop_waits_for_launch_lock_release(self):
+        server=local.LocalServer()
+        with tempfile.TemporaryDirectory() as root:
+            base=Path(root);(base/'logs').mkdir()
+            with patch.object(local,'SERVER_ROOT',base),patch.object(local,'RECORD',base/'record.json'),patch.object(server,'managed_pid',side_effect=[12,None,None]),patch.object(local,'process_identity',return_value='start'),patch.object(local.subprocess,'run') as signal_process,patch.object(local.fcntl,'flock',side_effect=[BlockingIOError(),None,None]),patch.object(local.time,'sleep') as sleep:
+                server._terminate()
+                sleep.assert_called_once_with(.1)
+                signal_process.assert_called_once()
+                self.assertEqual(server.snapshot()['status'],'stopped')
+
+    def test_auto_refresh_reports_ready_and_checkpoint(self):
+        server=local.LocalServer()
+        with patch.object(server,'health',return_value={'checkpoint':str(local.CHECKPOINT),'weights_strictly_loaded':813}),patch.object(server,'managed_pid',return_value=123):
+            server.refresh()
+        self.assertEqual(server.snapshot()['status'],'ready')
+        self.assertTrue(server.snapshot()['managed'])
+
+    def test_unmanaged_server_cannot_be_terminated(self):
+        server=local.LocalServer()
+        with patch.object(server,'managed_pid',return_value=None),patch.object(local.os,'pidfd_open',create=True) as opened:
+            with self.assertRaisesRegex(RuntimeError,'受管'):server._terminate()
+            opened.assert_not_called()
+
+    def test_close_during_inference_holds_before_stopping_server(self):
+        fixture=fixtures.GuiTests();fixture.setUp();m=fixture.m;m.busy=True
+        class Policy(fixtures.Policy):
+            def infer(self,obs):
+                m.submit('server_stop',{},'owner')
+                return super().infer(obs)
+        with patch.object(fixtures.client,'Policy',Policy),patch.object(m.local_server,'stop') as stop:
+            with self.assertRaises(fixtures.gui.PauseRequested):m.inference(fixture.data,True)
+            stop.assert_not_called()
+            m.pause_hold('pause to stop server')
+            self.assertEqual(m.mode,'holding')
+            self.assertEqual(len(m.robot.commands),1)
+            m.finish_server_stop()
+            stop.assert_called_once()
+            self.assertTrue(m.connected)
+
+    def test_failed_feedback_cancels_server_stop(self):
+        fixture=fixtures.GuiTests();fixture.setUp();m=fixture.m
+        m.mode='holding';m.server_stop_request={'must_hold':True}
+        with patch.object(m.robot,'maintain_hold',side_effect=RuntimeError('fault')),patch.object(m.local_server,'stop') as stop:
+            with self.assertRaisesRegex(RuntimeError,'fault'):m.finish_server_stop()
+            stop.assert_not_called()
+            self.assertIsNone(m.server_stop_request)
+
+    def test_server_stop_checks_control_owner(self):
+        fixture=fixtures.GuiTests();fixture.setUp();m=fixture.m
+        with self.assertRaisesRegex(ValueError,'控制权'):m.submit('server_stop',{},'other')
+        self.assertIsNone(m.server_stop_request)
+
+
+if __name__=='__main__':unittest.main()

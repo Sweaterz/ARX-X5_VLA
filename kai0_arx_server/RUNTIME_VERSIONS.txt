@@ -1,0 +1,14 @@
+# Observed on deployed .136 host; not a clean-install dependency lock.
+# Python 3.12; CUDA wheels must match the target driver.
+lerobot==0.6.1
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+transformers==5.5.4
+safetensors==0.8.0
+websockets==17.1
+msgpack==1.1.2
+numpy==2.2.6
+Pillow==12.3.0
+h5py==3.14.0
+av==15.1.0
+datasets==4.8.5

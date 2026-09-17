@@ -1,0 +1,23 @@
+import React,{useEffect,useState} from 'react';
+import {Download,Scissors,Play,Trash2} from 'lucide-react';
+export default function ExportPanel({episode,frames,s,send,pending,videos,onLocate}){
+ const task=s?.dagger?.task||{},busy=['running','exporting'].includes(task.status),disabled=!!(s?.connected||s?.dagger?.active||pending||busy);
+ const [parts,setParts]=useState(null),[mode,setMode]=useState('human'),[chosen,setChosen]=useState([]),[ranges,setRanges]=useState([]),[from,setFrom]=useState(0),[to,setTo]=useState(0),[pauses,setPauses]=useState(0);
+ useEffect(()=>{if(task.episode===episode&&task.operation==='inspect'&&task.status==='complete'&&task.segments){setParts(task.segments);setChosen(task.segments.filter(x=>x.intervention===1).map(x=>x.id));setMode('human');setRanges([]);setPauses(task.pause_events||0)}},[task.episode,task.operation,task.status,JSON.stringify(task.segments)]);
+ function changeMode(value){setMode(value);if(value!=='selected')setChosen(parts.filter(p=>value==='full'||p.intervention===1).map(p=>p.id))}
+ function seek(frame){onLocate(frame)}
+ function cursor(){return Math.max(0,Math.min(frames-1,Math.floor((videos.current.head?.currentTime||0)*30)))}
+ const eligible=parts?.filter(p=>mode!=='human'||p.intervention===1)||[];
+ const kept=eligible.filter(p=>chosen.includes(p.id));
+ const validRange=Number.isInteger(Number(from))&&Number.isInteger(Number(to))&&Number(from)>=0&&Number(to)>=Number(from)&&Number(to)<frames;
+ return <div className="export-editor"><div className="section-head"><div><h3>训练数据导出</h3><p className="hint">统一使用下一帧姿态作为 action；控制切换、暂停和排除区域处单独分段。</p></div><button disabled={disabled} onClick={()=>send('dagger_inspect',false,{episode})}>读取片段</button></div>
+ {!parts?<p className="hint">断开机械臂后读取片段，选择导出范围。默认只导出人工纠正段。</p>:<>
+ <div className="export-modes">{[['human','仅人工纠正段','默认 · 只保留人工示教'],['full','完整有效轨迹','策略＋人工，可排除错误段'],['selected','指定片段','回看后逐段选择']].map(([id,title,help])=><button key={id} className={mode===id?'selected':''} aria-pressed={mode===id} disabled={disabled} onClick={()=>changeMode(id)}><strong>{title}</strong><small>{help}</small></button>)}</div>
+ {mode==='full'&&<p className="hint">包含通过采样质量检查的策略与人工段；错误动作仍需回看后排除，不会自动判定任务动作正确。</p>}<div className="clip-list">{parts.map(p=><div className={'clip-row '+(chosen.includes(p.id)?'included':'excluded')} key={p.id}><label><input type="checkbox" aria-label={`选择片段 ${p.id}`} checked={chosen.includes(p.id)&&!(mode==='human'&&!p.intervention)} disabled={disabled||(mode==='human'&&!p.intervention)} onChange={e=>setChosen(e.target.checked?[...chosen,p.id]:chosen.filter(id=>id!==p.id))}/><span className={'clip-source '+(p.intervention?'human':'policy')}>{p.intervention?'人工纠正':'策略执行'}</span><span>片段 {p.segment}<small>帧 {p.start_frame}–{p.end_frame} · {p.frames} 帧 · {p.duration_s.toFixed(2)} 秒</small></span></label><button onClick={()=>seek(p.start_frame)}><Play size={13}/>定位回看</button></div>)}</div>
+ <p className="hint">暂停／保持事件 {pauses} 次：没有采样帧，自动排除。已录下的静止等待或错误动作，可取消整段勾选，或按下面的帧范围排除。</p>
+ <details className="range-editor"><summary><Scissors size={14}/>排除错误／保持画面</summary><p className="hint">帧号从 0 开始，包含起止帧。用视频播放位置标记范围，仅影响本次导出，不删除原始记录。</p><div className="range-inputs"><label>排除起始帧<input type="number" min="0" max={frames-1} value={from} onChange={e=>setFrom(e.target.value)} /></label><button onClick={()=>setFrom(cursor())}>当前帧为起点</button><label>排除结束帧<input type="number" min="0" max={frames-1} value={to} onChange={e=>setTo(e.target.value)} /></label><button onClick={()=>setTo(cursor())}>当前帧为终点</button><button disabled={disabled||!validRange} onClick={()=>setRanges([...ranges,[Number(from),Number(to)]])}>添加排除</button></div>
+ {ranges.map(([a,b],i)=><div className="excluded-range" key={i}><span>排除帧 {a}–{b}（{b-a+1} 帧）</span><button aria-label={`撤销排除 ${i+1}`} onClick={()=>setRanges(ranges.filter((_,j)=>i!==j))}><Trash2 size={14}/>撤销</button></div>)}</details>
+ <div className="export-destination"><span>导出保存位置 · qijun 电脑</span><code>{s?.dagger?.data_root}/exports/</code><small>每次导出自动创建独立的数据集文件夹。{task.episode===episode&&task.operation==='export'&&task.status==='complete'&&task.path&&<>本次已保存：<code>{task.path}</code></>}</small></div><div className="export-footer"><p>已选 {kept.length} 段 · 排除 {ranges.length} 个帧范围<small>不足 3 帧的剩余片段不导出；不会跨越删选位置生成动作目标。</small></p><button className="primary" disabled={disabled||!kept.length} onClick={()=>send('dagger_export',false,{episode,selection:{mode,selected_segments:mode==='selected'?chosen:[],excluded_segments:eligible.filter(p=>!chosen.includes(p.id)).map(p=>p.id),excluded_ranges:ranges}})}><Download size={16}/>导出 LeRobot v3.0</button></div>
+ </>}
+ </div>
+}

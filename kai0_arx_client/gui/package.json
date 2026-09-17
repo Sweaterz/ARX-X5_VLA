@@ -1,0 +1,1 @@
+{"name":"kai0-arx-console","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite --host 127.0.0.1","build":"vite build"},"dependencies":{"lucide-react":"^0.468.0","react":"^19.0.0","react-dom":"^19.0.0"},"devDependencies":{"@playwright/test":"^1.63.0","vite":"^7.0.0"}}

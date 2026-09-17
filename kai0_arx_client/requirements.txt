@@ -1,0 +1,5 @@
+# Python 3.12, matching the installed ARX SDK binary ABI.
+# numpy, Pillow and Pinocchio are reused from the host through --system-site-packages.
+websockets==15.0.1
+msgpack==1.1.1
+pyrealsense2==2.58.4.10922

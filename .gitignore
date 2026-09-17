@@ -1,0 +1,37 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+**/config.json
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+# Environments, caches and generated assets
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+node_modules/
+dist/
+dist-*/
+dagger-preview/
+data_deps/
+vendor_deps/
+.DS_Store
+# Models, captures and runtime state
+checkpoints/
+datasets/
+logs/
+audits/
+*.log
+*.h5
+*.hdf5
+*.mp4
+*.safetensors
+*.pt
+*.pth
+*.lock
+!package-lock.json
+CHECKPOINT_VERIFIED.json
+.CHECKPOINT_VERIFIED.tmp
