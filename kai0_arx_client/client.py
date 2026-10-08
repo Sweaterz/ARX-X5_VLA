@@ -94,6 +94,34 @@ def make_observation(state, images, prompt):
     return {'state': vector(state).astype(np.float32), 'images': result, 'prompt': prompt}
 
 
+def policy_chunk_count(metadata,config,requested=0):
+    """Resolve the UI override against the policy horizon.
+
+    A requested value of zero keeps the checkpoint recommendation. Positive
+    values let the operator shorten the receding-horizon execution window
+    without changing the model's predicted action chunk.
+    """
+    if type(requested) is not int or requested<0:
+        raise ValueError('Execution chunk length must be a non-negative integer')
+    count=(metadata.get('recommended_actions_per_chunk',config['control']['actions_per_chunk'])
+           if requested==0 else requested)
+    horizon=metadata.get('action_horizon')
+    if type(count) is not int or count<1:raise ValueError('Invalid policy execution chunk length')
+    if horizon is not None and (type(horizon) is not int or horizon<1 or count>horizon):raise ValueError('Execution chunk exceeds policy horizon')
+    return count
+
+
+def wait_policy_frame(index,chunk_started,config,tick):
+    """Scheduled trajectory time is distinct from inference latency. No catch-up bursts."""
+    deadline=chunk_started+index/config['control']['fps']
+    while True:
+        tick()
+        now=time.monotonic()
+        if now-deadline>.25:raise TimeoutError('Policy dispatch delayed >250ms; stop without catch-up')
+        if now>=deadline:return
+        time.sleep(min(.005,deadline-now))
+
+
 class Policy:
     def __init__(self, url, timeout):
         from websockets.sync.client import connect
@@ -239,6 +267,22 @@ class SDKRobot:
                     raise ValueError(f'Expected SDK feedback [7], got {q.shape}')
                 values.extend(q)
             return vector(values)
+
+    def read_gripper_feedback(self):
+        """Read gripper-only diagnostics without changing either arm's control mode."""
+        with self.lock:
+            if self.tripped.is_set():
+                raise TimeoutError('Motion watchdog expired; restart explicitly')
+            result=[]
+            for role,arm in zip(('left','right'),self.arms):
+                if arm.fault is not None:
+                    raise RuntimeError(f'ARX SDK fault: {arm.fault}')
+                item=dict(role=role,position=float(arm.get_gripper_pos()),
+                          velocity=float(arm.get_gripper_vel()),current=float(arm.get_gripper_current()))
+                if not all(math.isfinite(item[key]) for key in ('position','velocity','current')):
+                    raise ValueError(f'Invalid {role} gripper feedback')
+                result.append(item)
+            return result
 
     def command(self, action):
         with self.lock:
@@ -502,13 +546,13 @@ def run(args, c):
                 if elapsed > c['safety']['max_observation_age_s']:
                     raise TimeoutError(f'Observation/action round trip too old: {elapsed:.3f}s')
                 # Plain synchronous action chunking. No RTC fields or stale asynchronous queue.
-                count = min(len(actions), c['control']['actions_per_chunk'])
+                count = min(len(actions), policy_chunk_count(policy.metadata,c))
                 if args.steps:
                     count = min(count, args.steps - step)
-                for action in actions[:count]:
+                chunk_started=time.monotonic()
+                for index,action in enumerate(actions[:count]):
+                    wait_policy_frame(index,chunk_started,c,tick)
                     started = time.monotonic()
-                    if started - observed > c['safety']['max_observation_age_s']:
-                        raise TimeoutError('Remaining action chunk expired')
                     tick()
                     current = robot.read()
                     tick()
@@ -528,7 +572,7 @@ def run(args, c):
                     if isinstance(robot, MockRobot):
                         robot.q = target.copy()
                     step += 1
-                    time.sleep(max(0, 1 / c['control']['fps'] - (time.monotonic() - started)))
+                wait_policy_frame(count,chunk_started,c,tick)
                 print(f'steps={step} chunk={count} round_trip={elapsed:.3f}s motion={args.enable_motion}', flush=True)
         except CLIPauseRequested:
             write_event(log,event='operator_pause')

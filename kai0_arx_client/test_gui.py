@@ -1,4 +1,5 @@
 import json, threading, time, unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 import gui_server as gui
@@ -60,6 +61,159 @@ class GuiTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.m.submit('home',self.data,'other')
         with self.assertRaises(ValueError):self.m.submit('gravity',{},'owner')
         self.assertTrue(self.m.jobs.empty())
+
+    def test_repair_bypasses_only_a_stale_disconnected_owner(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None;self.m.owner='stale-page'
+        with self.assertRaisesRegex(ValueError,'确认'):
+            self.m.submit('repair',{},'new-page')
+        self.m.submit('repair',{'confirmed':True},'new-page')
+        self.assertTrue(self.m.busy)
+        self.assertEqual(self.m.owner,'new-page')
+        self.assertEqual(self.m.jobs.get_nowait()[0],'repair')
+
+    def test_repair_never_takes_over_a_connected_controller(self):
+        self.m.cams=None
+        for action in ('repair','release'):
+            for mode in ('gravity','protect','holding'):
+                with self.subTest(action=action,mode=mode):
+                    self.m.mode=mode
+                    with self.assertRaisesRegex(ValueError,'先断开'):
+                        self.m.submit(action,{'confirmed':True},'other-page')
+                    self.assertEqual(self.m.owner,'owner')
+                    self.assertFalse(self.m.busy)
+                    self.assertTrue(self.m.jobs.empty())
+
+    def test_repair_requires_both_devices_and_controller_handle_disconnected(self):
+        self.m.connected=False
+        with self.assertRaisesRegex(ValueError,'先断开'):
+            self.m.submit('repair',{'confirmed':True},'other-page')
+        self.m.robot=None
+        with self.assertRaisesRegex(ValueError,'先断开'):
+            self.m.submit('repair',{'confirmed':True},'other-page')
+        self.assertEqual(self.m.owner,'owner')
+        self.assertTrue(self.m.jobs.empty())
+
+    def test_repair_stops_known_services_and_clears_stale_owner(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None;self.m.owner='stale-page'
+        completed=SimpleNamespace(returncode=0,stdout='',stderr='')
+        with patch('urllib.request.urlopen',side_effect=OSError('offline')),\
+             patch.object(gui.subprocess,'run',return_value=completed) as run,\
+             patch.object(self.m,'_service_state',return_value='inactive'),\
+             patch.object(self.m,'_arm_lock_available',return_value=True),\
+             patch.object(self.m,'_video_device_owners',return_value=[]):
+            self.m.repair_conflicts()
+        commands=[call.args[0] for call in run.call_args_list]
+        self.assertTrue(any(command[:4]==['systemctl','--user','--no-block','stop'] for command in commands))
+        self.assertEqual(self.m.repair_status['state'],'success')
+        self.assertIsNone(self.m.owner)
+
+    def test_repair_execution_guard_prevents_blocking_live_feedback(self):
+        with patch.object(gui.subprocess,'run') as run,\
+             patch.object(self.m,'_read_local_status') as read,\
+             self.assertRaisesRegex(ValueError,'先断开'):
+            self.m.repair_conflicts()
+        run.assert_not_called();read.assert_not_called()
+        self.assertEqual(self.m.owner,'owner')
+        self.assertEqual(self.m.mode,'protect')
+
+    def test_repair_unknown_recording_state_does_not_stop_any_controller(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None
+        def state(unit):return 'active' if unit in gui.COLLECTION_SERVICES else 'inactive'
+        with patch.object(self.m,'_service_state',side_effect=state),\
+             patch.object(self.m,'_read_local_status',side_effect=OSError('offline')),\
+             patch.object(self.m,'_stop_service_group') as stop,\
+             self.assertRaisesRegex(RuntimeError,'录制状态不可核实'):
+            self.m.repair_conflicts()
+        stop.assert_not_called()
+        self.assertEqual(self.m.repair_status['state'],'error')
+
+    def test_repair_recording_or_unknown_state_does_not_stop_any_controller(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None
+        for recording in ('recording','saving',None):
+            with self.subTest(recording=recording),\
+                 patch.object(self.m,'_service_state',return_value='active'),\
+                 patch.object(self.m,'_read_local_status',return_value={'recording':{'state':recording},'arm':{'mode':'protect'}}),\
+                 patch.object(self.m,'_stop_service_group') as stop,\
+                 self.assertRaisesRegex(ValueError,'录制'):
+                self.m.repair_conflicts()
+            stop.assert_not_called()
+
+    def test_repair_unknown_collection_service_does_not_stop_any_controller(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None
+        with patch.object(self.m,'_service_state',return_value='unknown'),\
+             patch.object(self.m,'_stop_service_group') as stop,\
+             self.assertRaisesRegex(RuntimeError,'不可确认'):
+            self.m.repair_conflicts()
+        stop.assert_not_called()
+
+    def test_repair_refuses_to_stop_a_moving_tate_controller(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None
+        def state(unit):return 'active' if unit==gui.TATE_SERVICE else 'inactive'
+        def status(url):
+            if ':8090/' in url:raise OSError('offline')
+            return {'running':True,'mode':'testing'}
+        with patch.object(self.m,'_service_state',side_effect=state),\
+             patch.object(self.m,'_read_local_status',side_effect=status),\
+             self.assertRaisesRegex(ValueError,'TATE.*testing'):
+            self.m.repair_conflicts()
+        self.assertEqual(self.m.repair_status['state'],'error')
+
+    def test_repair_stops_held_tate_before_collection_services(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None
+        tate_checks=0;groups=[]
+        def state(unit):
+            nonlocal tate_checks
+            if unit==gui.TATE_SERVICE:
+                tate_checks+=1
+                return 'active' if tate_checks==1 else 'inactive'
+            return 'inactive'
+        def status(url):
+            if ':8090/' in url:raise OSError('offline')
+            return {'running':True,'mode':'holding'}
+        completed=SimpleNamespace(returncode=0,stdout='',stderr='')
+        with patch.object(self.m,'_service_state',side_effect=state),\
+             patch.object(self.m,'_read_local_status',side_effect=status),\
+             patch.object(self.m,'_stop_service_group',side_effect=lambda units,force:groups.append((tuple(units),force)) or {}),\
+             patch.object(self.m,'_arm_lock_available',return_value=True),\
+             patch.object(self.m,'_video_device_owners',return_value=[]),\
+             patch.object(gui.subprocess,'run',return_value=completed):
+            self.m.repair_conflicts()
+        self.assertEqual(groups[0],((gui.TATE_SERVICE,),False))
+        self.assertEqual(groups[1],(gui.COLLECTION_SERVICES,False))
+        self.assertEqual(self.m.repair_status['state'],'success')
+
+    def test_repair_rechecks_capture_restored_by_tate(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None
+        restored=False;groups=[]
+        def state(unit):
+            if unit==gui.TATE_SERVICE:return 'inactive' if restored else 'active'
+            return 'active' if restored else 'inactive'
+        def status(url):
+            if ':8090/' in url:raise OSError('recording state unavailable')
+            return {'running':True,'mode':'holding'}
+        def stop(units,force):
+            nonlocal restored
+            groups.append((tuple(units),force));restored=True
+        with patch.object(self.m,'_service_state',side_effect=state),\
+             patch.object(self.m,'_read_local_status',side_effect=status),\
+             patch.object(self.m,'_stop_service_group',side_effect=stop),\
+             self.assertRaisesRegex(RuntimeError,'录制状态不可核实'):
+            self.m.repair_conflicts()
+        self.assertEqual(groups,[((gui.TATE_SERVICE,),False)])
+
+    def test_nonforcing_service_stop_never_kills_a_stuck_controller(self):
+        completed=SimpleNamespace(returncode=0,stdout='',stderr='')
+        with patch.object(gui.subprocess,'run',return_value=completed) as run,\
+             patch.object(self.m,'_service_state',return_value='active'),\
+             self.assertRaisesRegex(RuntimeError,'未强制结束'):
+            self.m._stop_service_group(gui.COLLECTION_SERVICES,grace_s=0,force=False)
+        self.assertEqual(len(run.call_args_list),1)
+        self.assertNotIn('kill',run.call_args.args[0])
+
+    def test_failed_disconnected_operation_releases_page_owner(self):
+        self.m.robot=None;self.m.connected=False;self.m.cams=None;self.m.owner='failed-page'
+        self.m.recover_error(RuntimeError('connect failed'))
+        self.assertIsNone(self.m.owner)
     def test_stop_works_while_busy_and_latches(self):
         self.m.busy=True;self.m.submit('stop',{},'other')
         self.assertTrue(self.m.stop_event.is_set());self.assertTrue(self.m.latched)

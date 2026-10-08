@@ -12,7 +12,7 @@ import numpy as np
 import h5py
 import av
 from dagger_data import ROLES,episode_path
-from dagger_segments import inventory,select_parts
+from dagger_segments import human_motion_trim_ranges,inventory,select_parts
 
 
 def emit(**data):print(json.dumps(data,ensure_ascii=False),flush=True)
@@ -170,8 +170,16 @@ def export(root,episode,options=None):
     with h5py.File(path/'trajectory.h5','r') as h:
         q=h['qpos'][:];t=h['timestamp'][:];labels=h['intervention'][:];segments=h['segment'][:]
     options=options or {'mode':'human'}
+    if not isinstance(options,dict):raise ValueError('导出选项必须为对象')
+    effective_options=dict(options);trim_report=[];trim_config=None
+    trim_option=options.get('human_motion_trim',False)
+    if trim_option is not False:
+        automatic_ranges,trim_report,trim_config=human_motion_trim_ranges(q,t,labels,segments,trim_option)
+        manual_ranges=options.get('excluded_ranges',[])
+        if not isinstance(manual_ranges,list):raise ValueError('排除范围无效')
+        effective_options['excluded_ranges']=[*manual_ranges,*automatic_ranges]
     groups=[];provenance=[]
-    for part in select_parts(t,labels,segments,options):
+    for part in select_parts(t,labels,segments,effective_options):
         grid=np.arange(t[part[0]],t[part[-1]],1/30)
         if len(grid)<2:continue
         interpolated=np.stack([np.interp(grid,t[part],q[part,j]) for j in range(14)],axis=1).astype('f4')
@@ -222,7 +230,9 @@ def export(root,episode,options=None):
     observation={'observation.state':sample['observation.state'],'task':meta['prompt']}
     observation.update({f'observation.images.{r}':sample[f'observation.images.{r}'] for r in ROLES})
     pre(observation)
-    report={'source':episode,'human_only':all(p['intervention']==1 for p in provenance),'selection':options,'source_segments':provenance,
+    report={'source':episode,'source_files_modified':False,'human_only':all(p['intervention']==1 for p in provenance),'selection':options,
+            'effective_excluded_ranges':effective_options.get('excluded_ranges',[]),'human_motion_trim':{'config':trim_config,'segments':trim_report} if trim_config else None,
+            'source_segments':provenance,
             'action_definition':'next feedback pose at +1/30s for both policy and human; no cross-cut targets','action_shift_frames':1,'fps':30,'segments':len(groups),
             'action_chunk':[50,14],'processor_validated':True,'segment_padding_validated':True,'frames':len(loaded),'original_training_alignment_verified':False}
     atomic_json(tmp/'dagger_export.json',report);os.replace(tmp,output)

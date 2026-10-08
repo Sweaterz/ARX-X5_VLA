@@ -44,10 +44,10 @@ class SessionTests(unittest.TestCase):
         with patch.object(m.dagger,'sample'),patch.object(test_gui.client,'Policy',Policy):
             with self.assertRaises(gui.PauseRequested):m.inference(fixture.data,True)
         self.assertEqual(m.robot.commands,[])
-        m.pause_hold('takeover');self.assertEqual(len(m.robot.commands),1)
+        m.pause_hold('takeover');self.assertEqual(len(m.robot.commands),0)
         for arm in m.robot.arms:arm.gravity_compensation=Mock(return_value=True)
         m.handle_dagger_pending();self.assertEqual(m.dagger.phase,'human');self.assertEqual(m.mode,'gravity')
-        self.assertEqual(len(m.robot.commands),1)
+        self.assertEqual(len(m.robot.commands),1)  # rebase feedback before releasing JOINT control
         m.submit('dagger_end_correction',{},'owner');m.pause_hold('end correction');m.handle_dagger_pending()
         self.assertEqual(m.dagger.phase,'paused');self.assertEqual(m.mode,'holding')
         self.assertEqual(len(m.robot.commands),2)

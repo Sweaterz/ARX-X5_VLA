@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Local ARX console. Starting HTTP never initializes hardware."""
-import argparse, collections, io, json, os, queue, secrets, signal, subprocess, threading, time
+import argparse, collections, fcntl, io, json, os, queue, secrets, signal, subprocess, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse,parse_qs
 import numpy as np
 import client
+import device_release
 from control_runtime import IOLanes, background_close
 from local_server import LocalServer
 from camera_process import CameraProcess
@@ -16,6 +17,15 @@ from replay_runtime import Replay
 
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT=Path(os.environ.get("ARX_GUI_STATIC_ROOT",str(ROOT/"gui/dist"))).resolve()
+TAKEOVER_LAST_TARGET_HOLD_S=1.0
+TAKEOVER_SETTLE_STABLE_S=.2
+TAKEOVER_SETTLE_TIMEOUT_S=.75
+ARM_JOINT_INDICES=np.array([*range(6),*range(7,13)])
+GRIPPER_DIAGNOSTIC_INTERVAL_S=.1
+COLLECTION_SERVICES=('arx-data-station.service','arx-button-control.service')
+TATE_SERVICE='tate-arx-ui.service'
+CONFLICT_SERVICES=(*COLLECTION_SERVICES,TATE_SERVICE)
+ARM_CONTROL_LOCK=Path(os.environ.get('XDG_RUNTIME_DIR',f'/run/user/{os.getuid()}'))/'arx-arm-control.lock'
 
 class PauseRequested(Exception):
     pass
@@ -36,7 +46,10 @@ class Manager:
         self.jobs = queue.Queue(maxsize=1); self.stop_event = threading.Event()
         self.pause_event = threading.Event(); self.detached = False
         self.hold_target = None; self.hold_started_at = None; self.hold_source = None
+        self.gripper_feedback=None;self.gripper_feedback_error='';self.last_gripper_feedback_at=0.
         self.io = IOLanes(); self.camera_failed = False
+        self.repair_status={'state':'idle','message':'未执行'}
+        self.release_status={'state':'idle','message':'未执行'}
         self.local_server = LocalServer()
         self.server_stop_request = None
         self.dagger = Dagger()
@@ -60,6 +73,29 @@ class Manager:
             except OSError as exc:
                 self.error = f'日志写入失败：{exc}'
 
+    def update_gripper_diagnostics(self):
+        active=self.dagger.active and self.dagger.phase=='human' and self.mode=='gravity'
+        if not active:
+            self.gripper_feedback=None
+            self.gripper_feedback_error=''
+            return
+        now=self.observed_at
+        if now-self.last_gripper_feedback_at<GRIPPER_DIAGNOSTIC_INTERVAL_S:return
+        reader=getattr(self.robot,'read_gripper_feedback',None)
+        if not callable(reader):return
+        self.last_gripper_feedback_at=now
+        try:
+            feedback=reader()
+        except Exception as exc:
+            message=str(exc)
+            if message!=self.gripper_feedback_error:
+                self.gripper_feedback_error=message
+                self.event('夹爪反馈诊断不可用：'+message,level='warning')
+            return
+        self.gripper_feedback_error=''
+        self.gripper_feedback={'observed_at':now,'arms':feedback}
+        self.event('夹爪反馈诊断',grippers=feedback)
+
     def beat(self, owner):
         with self.lock:
             if self.owner == owner: self.heartbeat = time.monotonic()
@@ -76,6 +112,22 @@ class Manager:
                 if data.get('confirmed') is not True: raise ValueError('需要操作者确认')
                 self.owner=owner; self.detached=False; self.heartbeat=time.monotonic()
                 return
+            if action == 'end_use':
+                device_release.validate_request(self, data, owner)
+                self.release_status={'state':'running','message':'正在检查并释放设备…'}
+                self.busy=True; self.jobs.put_nowait(('end_use',data)); return
+            if action in {'repair','release'}:
+                if data.get('confirmed') is not True: raise ValueError('需要操作者确认')
+                if self.connected or self.robot or self.cams:
+                    raise ValueError('请先断开 Kai0 机械臂和相机，再修复连接冲突')
+                if self.busy or self.latched or self.dagger.active: raise ValueError('当前有任务或停止锁定，不能自动修复')
+                if self.server_stop_request is not None: raise ValueError('Server 正在关闭')
+                if self.dagger.task.get('status') in {'running','exporting'}: raise ValueError('数据处理期间不能自动修复')
+                # Repair is deliberately allowed to replace a stale page owner while
+                # no Kai0 device is connected. It never takes over a live controller.
+                self.owner=owner; self.detached=False;self.heartbeat=time.monotonic()
+                self.repair_status={'state':'running','message':'正在停止冲突服务并释放设备'}
+                self.busy=True;self.jobs.put_nowait(('repair',data));return
             if action.startswith('replay_'):
                 return self.submit_replay(action,data,owner)
             if action.startswith('dagger_'):
@@ -96,18 +148,24 @@ class Manager:
                     self.dagger.invalidate(); self.dagger.pending=None; self.pause_event.set()
                 self.event('关闭 Server 已请求；活动任务先暂停并确认保持')
                 return
+            if action == 'server_checkpoint':
+                if self.owner and self.owner != owner: raise ValueError('另一页面持有控制权')
+                if self.busy or self.dagger.active: raise ValueError('请先结束当前任务')
+                if self.server_stop_request is not None: raise ValueError('正在处理 Server 关闭请求')
+                self.local_server.select_checkpoint(data.get('checkpoint'),folder=True) if data.get('folder') is True else self.local_server.select_checkpoint(data.get('checkpoint'))
+                self.event('已选择 checkpoint',checkpoint=self.local_server.snapshot()['checkpoint'])
+                return
             if self.server_stop_request is not None: raise ValueError('正在处理 Server 关闭请求')
-            if action not in {'connect','disconnect','protect','gravity','home','cameras','test','run','release','server_start'}:
+            if action not in {'connect','disconnect','protect','gravity','home','cameras','test','run','server_start'}:
                 raise ValueError('未知操作')
             if self.detached and self.connected: raise ValueError('请先接管后台保持；急停始终可用')
             if self.dagger.active and action not in {'disconnect'}: raise ValueError('请先结束或丢弃当前 DAgger 试验')
             if self.dagger.active and action=='disconnect' and self.dagger.phase not in {'paused','error'}:raise ValueError('先暂停并保存 DAgger 试验')
             if self.dagger.task.get('status') in {'running','exporting'} and action in {'connect','run'}:raise ValueError('数据处理期间不能启动机械臂控制')
             if self.busy: raise ValueError('正在执行操作，请先停止')
-            if action=='server_start' and self.connected: raise ValueError('请先放稳并断开机械臂，再加载本机模型')
             if self.owner and self.owner != owner: raise ValueError('另一页面持有控制权')
             if self.latched and action not in {'disconnect'}: raise ValueError('停止已锁定，请先断开，再重新连接')
-            if action in {'connect','disconnect','gravity','run','release'} and data.get('confirmed') is not True:
+            if action in {'connect','disconnect','gravity','run'} and data.get('confirmed') is not True:
                 raise ValueError('需要操作者确认')
             if action in {'gravity','home','test','run','protect'} and not self.connected:
                 raise ValueError('请先连接机械臂')
@@ -118,11 +176,12 @@ class Manager:
                 if self.local_server.snapshot()['status'] in {'starting','stopping'}: raise ValueError('Server 正在切换状态')
                 if not self.cams: raise ValueError('请先连接相机')
                 steps = data.get('steps',30)
-                if not isinstance(steps,int) or not 1 <= steps <= 300: raise ValueError('步数须为 1–300')
+                if type(steps) is not int or steps < 0: raise ValueError('步数须为非负整数；0 表示持续运行')
+                chunk_steps=data.get('chunk_steps',0)
+                if type(chunk_steps) is not int or chunk_steps<0:raise ValueError('每块执行步数须为非负整数；0 表示使用 checkpoint 默认值')
                 if data.get('server') != self.config['server']['url']: raise ValueError('服务地址须与 config.json 一致')
                 if not isinstance(data.get('prompt'),str) or not data['prompt'].strip(): raise ValueError('任务描述不能为空')
             if action == 'connect':
-                if self.local_server.snapshot()['status']=='starting': raise ValueError('本机模型正在加载，请就绪后再连接机械臂')
                 if self.exit_pending: raise ValueError('后台等待退出；请退出后重新启动')
                 self.stop_event.clear(); self.pause_event.clear(); self.detached=False; self.owner = owner; self.heartbeat = time.monotonic()
             self.busy = True
@@ -171,7 +230,8 @@ class Manager:
             if action=='dagger_start':
                 if d.active or (d.recorder and not d.recorder.done.is_set()):raise ValueError('先完成当前试验保存')
                 if not isinstance(data.get('prompt'),str) or not data['prompt'].strip():raise ValueError('任务描述不能为空')
-                if not isinstance(data.get('steps'),int) or not 1<=data['steps']<=300:raise ValueError('步数须为 1–300')
+                if type(data.get('steps')) is not int or data['steps']<0:raise ValueError('步数须为非负整数；0 表示持续运行')
+                if type(data.get('chunk_steps',0)) is not int or data.get('chunk_steps',0)<0:raise ValueError('每块执行步数须为非负整数；0 表示使用 checkpoint 默认值')
             elif not d.active or d.phase!='paused':raise ValueError('没有可恢复的试验')
             self.busy=True;self.jobs.put_nowait((action,data));return
         if action not in {'dagger_takeover','dagger_end_correction','dagger_finish','dagger_discard','dagger_pause'}:raise ValueError('未知 DAgger 操作')
@@ -193,7 +253,8 @@ class Manager:
                 if time.monotonic()>deadline:raise RuntimeError('录制进程启动超时')
                 time.sleep(.01)
         d.error='';d.invalidate();d.transition('policy','开始策略执行')
-        config=dict(server=self.config['server']['url'],prompt=d.metadata['prompt'],steps=d.metadata['steps'])
+        config=dict(server=self.config['server']['url'],prompt=d.metadata['prompt'],steps=d.metadata['steps'],
+                    chunk_steps=d.metadata.get('chunk_steps',0))
         self.inference(config,True)
 
     def handle_dagger_pending(self):
@@ -203,17 +264,41 @@ class Manager:
         self.check_stop()
         if not self.connected or self.mode!='holding':raise RuntimeError('未确认保持，取消 DAgger 切换')
         if action=='dagger_takeover':
-            d.transition('transition','进入双臂重力补偿')
-            if not self.demo:
-                try:
-                    with self.robot.lock:
-                        for arm in self.robot.arms:
-                            self.check_stop()
-                            if arm.gravity_compensation() is not True:raise RuntimeError('SDK 未确认切换成功')
-                except Exception as exc:
-                    raise HardwareControlError('双臂重力补偿切换未全部确认：'+str(exc)) from exc
-            self.mode='gravity';self.hold_target=None;self.hold_started_at=None
-            d.transition('human','人工拖动纠正，夹爪手动拨动')
+            self.busy=True
+            try:
+                d.transition('transition','保留 SDK 最后目标 1 秒，再进入重力补偿')
+                started=time.monotonic()
+                self.event('人工接管：保持最后目标 1 秒',hold_target_rad=self.hold_target)
+                while time.monotonic()-started<TAKEOVER_LAST_TARGET_HOLD_S:
+                    self.tick()
+                    time.sleep(min(.01,max(0.,TAKEOVER_LAST_TARGET_HOLD_S-(time.monotonic()-started))))
+                self.tick()
+                d.transition('transition','锚定实测位置并确认双臂静止')
+                if not self.demo:
+                    held=self.robot.hold_current()
+                    self.state=held.tolist();self.observed_at=time.monotonic()
+                    self.hold_target=self.state.copy();self.hold_source='takeover_feedback_rebase';self.hold_started_at=time.monotonic()
+                    self.event('人工接管：切换前锚定实测位置',hold_target_rad=self.hold_target)
+                    previous=np.asarray(held);stable_since=None;deadline=time.monotonic()+TAKEOVER_SETTLE_TIMEOUT_S
+                    while True:
+                        self.tick();now=time.monotonic();current=np.asarray(self.state)
+                        if np.max(np.abs(current[ARM_JOINT_INDICES]-previous[ARM_JOINT_INDICES]))<=.003:
+                            stable_since=stable_since or now
+                            if now-stable_since>=TAKEOVER_SETTLE_STABLE_S:break
+                        else:stable_since=None
+                        if now>=deadline:raise RuntimeError('切换前双臂未稳定，人工接管已取消')
+                        previous=current.copy();time.sleep(.01)
+                    try:
+                        with self.robot.lock:
+                            for arm in self.robot.arms:
+                                self.check_stop()
+                                if arm.gravity_compensation() is not True:raise RuntimeError('SDK 未确认切换成功')
+                    except Exception as exc:
+                        raise HardwareControlError('双臂重力补偿切换未全部确认：'+str(exc)) from exc
+                    self.mode='gravity';self.hold_target=None;self.hold_started_at=None
+                self.mode='gravity';self.hold_target=None;self.hold_started_at=None
+                d.transition('human','人工拖动纠正，夹爪手动拨动')
+            finally:self.busy=False
         elif action in {'dagger_finish','dagger_discard'}:
             d.transition('saving','关闭 episode 写入边界')
             d.recorder.finish(data.get('result','unfinished'),action=='dagger_discard')
@@ -250,10 +335,21 @@ class Manager:
                    hold_source=self.hold_source, gripper_included=True)
 
     def pause_hold(self, reason):
+        if self.stop_event.is_set():raise InterruptedError('软件停止优先于保持')
         if self.replay.phase in {'playing','aligning'}:self.replay.phase='paused'
         elif self.replay.phase=='loading':self.replay.phase='empty'
-        if self.dagger.active:self.dagger.transition('paused',reason)
-        self.enter_hold(reason)
+        d=self.dagger
+        takeover=d.active and d.pending and d.pending[0]=='dagger_takeover' and not self.detached
+        if takeover and self.mode in {'running','holding'}:
+            # Keep the last SDK joint/gripper target, do not replace it with feedback.
+            held=self.robot.read() if self.demo else self.robot.maintain_hold()
+            if self.mode!='holding':
+                self.hold_target=list(d.last_action) if d.last_action is not None else None
+                self.hold_started_at=time.monotonic();self.hold_source='sdk_last_action'
+            self.state=held.tolist();self.observed_at=time.monotonic();self.mode='holding'
+            self.event('人工接管：停止新策略动作，保留 SDK 最后目标',hold_target_rad=self.hold_target)
+        else:self.enter_hold(reason)
+        if d.active:d.transition('paused',reason)
         self.pause_event.clear()
         if self.detached:self.owner=None;self.dagger.pending=None
         while True:
@@ -296,6 +392,7 @@ class Manager:
             self.mode = 'protect'
 
     def disconnect(self):
+        self.gripper_feedback=None;self.gripper_feedback_error='';self.last_gripper_feedback_at=0.
         if self.dagger.active:self.dagger.transition('paused','设备断开，录制暂停')
         self.hold_target=None; self.hold_started_at=None
         if self.cams:
@@ -329,6 +426,7 @@ class Manager:
             if self.last_tick_at is not None:
                 self.tick_gap_max_s=max(self.tick_gap_max_s,self.observed_at-self.last_tick_at)
             self.last_tick_at=self.observed_at
+            self.update_gripper_diagnostics()
             self.dagger.sample(self)
 
     def read_images(self):
@@ -366,6 +464,10 @@ class Manager:
             self.event("控制异常，取消 Server 关闭请求",level="error")
             self.server_stop_request=None
         self.error=str(exc)
+        if not self.robot:
+            # A constructor failure happens before SDKRobot is assigned. Do not
+            # leave that failed page as the permanent owner of a disconnected UI.
+            self.owner=None;self.detached=False
         if self.robot and not self.stop_event.is_set() and not isinstance(exc, HardwareControlError):
             try:
                 if self.mode in {'protect','gravity'}:
@@ -391,6 +493,147 @@ class Manager:
             except queue.Empty:break
         self.busy=False
 
+    def _service_state(self, unit):
+        try:
+            result=subprocess.run(['systemctl','--user','is-active',unit],capture_output=True,
+                                  text=True,timeout=2)
+        except (OSError,subprocess.TimeoutExpired):
+            return 'unknown'
+        return result.stdout.strip() or 'unknown'
+
+    def _arm_lock_available(self):
+        ARM_CONTROL_LOCK.parent.mkdir(parents=True,exist_ok=True)
+        fd=os.open(ARM_CONTROL_LOCK,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        try:
+            try:
+                fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(fd,fcntl.LOCK_UN)
+            return True
+        finally:
+            os.close(fd)
+
+    def _video_device_owners(self):
+        devices=sorted(Path('/dev').glob('video*'))
+        if not devices:return []
+        try:
+            result=subprocess.run(['lsof','-t',*[str(path) for path in devices]],
+                                  capture_output=True,text=True,timeout=3)
+        except (OSError,subprocess.TimeoutExpired):
+            return ['unknown']
+        return sorted(set(result.stdout.split()))
+
+    def _read_local_status(self, url):
+        import urllib.request
+        with urllib.request.urlopen(url,timeout=1.5) as response:
+            return json.load(response)
+
+    def _stop_service_group(self, units, grace_s=6, force=True):
+        stopped=subprocess.run(['systemctl','--user','--no-block','stop',*units],
+                               capture_output=True,text=True,timeout=4)
+        if stopped.returncode:
+            raise RuntimeError('无法请求停止服务：'+(stopped.stderr.strip() or '未知错误'))
+        deadline=time.monotonic()+grace_s
+        while time.monotonic()<deadline:
+            states={unit:self._service_state(unit) for unit in units}
+            if all(state in {'inactive','failed'} for state in states.values()):return states
+            time.sleep(.25)
+        states={unit:self._service_state(unit) for unit in units}
+        stuck=[unit for unit,state in states.items() if state not in {'inactive','failed'}]
+        if stuck and not force:
+            raise RuntimeError('控制服务尚未正常退出，未强制结束，请稍后检查')
+        for unit in stuck:
+            subprocess.run(['systemctl','--user','kill','--signal=SIGKILL',unit],
+                           capture_output=True,text=True,timeout=3)
+        if stuck:
+            subprocess.run(['systemctl','--user','--no-block','stop',*stuck],
+                           capture_output=True,text=True,timeout=3)
+            deadline=time.monotonic()+3
+            while time.monotonic()<deadline:
+                states={unit:self._service_state(unit) for unit in units}
+                if all(state in {'inactive','failed'} for state in states.values()):return states
+                time.sleep(.2)
+        states={unit:self._service_state(unit) for unit in units}
+        if not all(state in {'inactive','failed'} for state in states.values()):
+            raise RuntimeError('服务未全部停止：'+json.dumps(states,ensure_ascii=False))
+        return states
+
+    def repair_conflicts(self):
+        # External service probes and shutdowns may block for seconds. Never run
+        # them while this manager owns a controller that needs feedback ticks.
+        with self.lock:
+            if self.connected or self.robot or self.cams:
+                raise ValueError('请先断开 Kai0 机械臂和相机，再修复连接冲突')
+        if self.demo:
+            self.repair_status={'state':'success','message':'演示模式无需释放设备'}
+            self.owner=None
+            return
+        self.event('一键修复开始：检查并停止已知冲突控制器')
+        try:
+            def check_collection():
+                states={unit:self._service_state(unit) for unit in COLLECTION_SERVICES}
+                if any(state not in {'active','inactive','failed'} for state in states.values()):
+                    raise RuntimeError('采集控制服务状态正在变化或不可确认，已拒绝自动停止')
+                if not any(state=='active' for state in states.values()):return
+                try:
+                    station=self._read_local_status('http://127.0.0.1:8090/api/status')
+                except Exception as exc:
+                    raise RuntimeError('采集服务正在运行但录制状态不可核实，已拒绝自动停止') from exc
+                recording=station.get('recording',{}).get('state')
+                arm_mode=station.get('arm',{}).get('mode')
+                if recording!='idle':raise ValueError('采集服务正在录制，已拒绝自动停止')
+                if arm_mode not in {'protect','disconnected','idle'}:
+                    raise ValueError(f'采集机械臂模式为 {arm_mode or "未知"}，请先放稳并转保护模式')
+                self.event('保存一键修复前采集状态',snapshot=station)
+
+            # Verify every active recorder before stopping any known controller.
+            check_collection()
+
+            tate_state=self._service_state(TATE_SERVICE)
+            if tate_state not in {'inactive','failed'}:
+                try:tate=self._read_local_status('http://127.0.0.1:8089/api/status')
+                except Exception as exc:
+                    raise RuntimeError('TATE 控制器正在运行但状态不可核实，已拒绝自动停止') from exc
+                if tate.get('running') and tate.get('mode')!='holding':
+                    raise ValueError(f'TATE 正处于 {tate.get("mode") or "未知"} 模式，仅允许释放已保持的机械臂')
+                self.event('检测到 TATE 控制器，已确认无运动或处于位置保持',snapshot=tate)
+                # Stop TATE first. Its wrapper may restore the collection units
+                # while exiting, so those units are stopped again afterwards.
+                self._stop_service_group((TATE_SERVICE,),force=False)
+
+            # TATE may restart collection units on exit. Their new recording
+            # state must be checked rather than relying on the earlier snapshot.
+            check_collection()
+            self._stop_service_group(COLLECTION_SERVICES,force=False)
+
+            subprocess.run(['systemctl','--user','reset-failed',*CONFLICT_SERVICES],
+                           capture_output=True,text=True,timeout=3)
+            states={unit:self._service_state(unit) for unit in CONFLICT_SERVICES}
+            if not all(state=='inactive' for state in states.values()):
+                raise RuntimeError('冲突控制服务未全部停止：'+json.dumps(states,ensure_ascii=False))
+            deadline=time.monotonic()+2
+            while time.monotonic()<deadline:
+                lock_ready=self._arm_lock_available()
+                if lock_ready and not self._video_device_owners():break
+                time.sleep(.2)
+            if not self._arm_lock_available():
+                raise RuntimeError('已知服务已停止，但机械臂锁仍被未知控制器占用')
+            video_owners=self._video_device_owners()
+            if video_owners:
+                raise RuntimeError('已知服务已停止，但相机仍被其他进程占用：'+','.join(video_owners))
+            self.error=''
+            self.repair_status={'state':'success','message':'冲突服务已停止，机械臂锁和相机已释放'}
+            self.event('一键修复完成：可重新连接机械臂和相机',services=states)
+        except Exception as exc:
+            self.repair_status={'state':'error','message':str(exc)}
+            raise
+        finally:
+            # The disconnected-only contract makes clearing stale ownership safe.
+            with self.lock:
+                self.owner=None
+                self.detached=False
+
     def loop(self):
         last_camera = 0
         last_timing = time.monotonic()
@@ -413,7 +656,7 @@ class Manager:
                 try: action,data=self.jobs.get(timeout=.01 if self.dagger.active else .04)
                 except queue.Empty: continue
                 try:
-                    if action != 'disconnect': self.check_stop()
+                    if action not in {'disconnect','end_use'}: self.check_stop()
                     self.execute(action,data)
                     self.event('操作完成：'+action)
                 finally:
@@ -432,6 +675,8 @@ class Manager:
 
     def execute(self, action, data):
         self.error=''
+        if action == 'end_use':
+            return device_release.release(self, CONFLICT_SERVICES, TATE_SERVICE, ARM_CONTROL_LOCK)
         if action.startswith('replay_'):
             if action=='replay_load':return self.replay.load(self,data.get('episode',''))
             if action=='replay_align':return self.replay.align(self)
@@ -440,7 +685,7 @@ class Manager:
             return self.execute_dagger(action,data)
         if action=='server_start':
             if self.demo: raise ValueError('演示模式不启动真实 server')
-            self.local_server.start()
+            self.local_server.start(prompt=data.get('prompt'))
             self.event('已请求启动本机推理 server；不操作机械臂')
         elif action=='connect':
             if self.robot: raise ValueError('已经连接')
@@ -500,21 +745,7 @@ class Manager:
                 self.event('相机已连接', camera_backend='synthetic' if self.demo else 'separate_process',
                            camera_pid=getattr(self.cams,'pid',None))
                 self.read_images()
-        elif action=='release':
-            if self.robot or self.cams: raise ValueError('请先断开 GUI 设备')
-            if self.demo: return
-            import urllib.request
-            try:
-                with urllib.request.urlopen('http://127.0.0.1:8090/api/status',timeout=3) as f:s=json.load(f)
-            except Exception:
-                for unit in ('arx-data-station.service','arx-button-control.service'):
-                    p=subprocess.run(['systemctl','--user','is-active',unit],capture_output=True,text=True)
-                    if p.stdout.strip()!='inactive': raise ValueError('采集状态不可核实，拒绝停止服务')
-                return
-            if s['recording']['state']!='idle' or s['arm']['mode']!='protect':
-                raise ValueError('仅在录制空闲且双臂保护模式下释放服务')
-            self.event('保存停止前状态',snapshot=s)
-            subprocess.run(['systemctl','--user','stop','arx-data-station.service','arx-button-control.service'],check=True,timeout=75)
+        elif action=='repair':self.repair_conflicts()
         elif action in ('test','run'): self.inference(data,action=='run')
 
     def inference(self,data,motion):
@@ -523,7 +754,7 @@ class Manager:
         if motion: self.hold_target=None; self.hold_started_at=None
         self.mode='running' if motion else 'testing'; done=0; all_violations=[]
         request_trace=[]
-        policy=None
+        policy=None;execution_steps=client.policy_chunk_count({},self.config,data.get('chunk_steps',0))
         try:
             if not self.demo:
                 policy=self.io.call('policy', lambda: client.Policy(data['server'],self.config['server']['timeout_s']),
@@ -533,8 +764,9 @@ class Manager:
                 if motion and (meta.get('test_only') is not False or meta.get('motion_enabled') is not True
                                or meta.get('action_dim') != 14 or meta.get('mode')!='checkpoint'):
                     raise ValueError('服务元数据不允许真机执行')
-                self.event('推理服务已连接',metadata=meta)
-            while done<data['steps']:
+                execution_steps=client.policy_chunk_count(meta,self.config,data.get('chunk_steps',0))
+                self.event('推理服务已连接',metadata=meta,actions_per_chunk=execution_steps)
+            while data['steps']==0 or done<data['steps']:
                 self.check_stop(); observed=time.monotonic()
                 current=self.robot.read(); self.read_images()
                 obs=client.make_observation(current,self.images,data['prompt'])
@@ -548,19 +780,22 @@ class Manager:
                 self.check_stop()
                 age=time.monotonic()-observed
                 if age>self.config['safety']['max_observation_age_s']:raise TimeoutError('推理观测超过 1.5 秒')
-                count=min(len(actions),self.config['control']['actions_per_chunk'],data['steps']-done) if motion else 1
+                count=min(len(actions),execution_steps) if motion else 1
+                if motion and data['steps']>0:count=min(count,data['steps']-done)
                 # No-motion test inspects the entire predicted chunk, never calls command().
                 if not motion:
                     for index,a in enumerate(actions):
                         all_violations.extend(dict(horizon=index, **x) for x in client.diagnostic_violations(a, self.config))
-                    done=data['steps']
+                    done=1
                 else:
-                    for a in actions[:count]:
+                    chunk_started=time.monotonic()
+                    for index,a in enumerate(actions[:count]):
+                        client.wait_policy_frame(index,chunk_started,self.config,self.tick)
                         self.check_stop()
                         with self.lock:
                             self.check_stop()
                             if generation!=self.dagger.generation:raise PauseRequested('旧动作块已失效')
-                            if time.monotonic()-observed>self.config['safety']['max_observation_age_s']:raise TimeoutError('动作块过期')
+                            if time.monotonic()-(chunk_started+index/self.config['control']['fps'])>.25:raise TimeoutError('动作下发延迟超过250ms，停止且不补发')
                             command_at=time.monotonic()
                             if not self.demo:self.robot.command(a)
                             else:self.robot.q=a.copy()
@@ -568,12 +803,14 @@ class Manager:
                                                   sdk_call_ms=round((time.monotonic()-command_at)*1000,3),target_rad=a.tolist()))
                         self.dagger.last_action=a.tolist();self.dagger.policy_action=a.tolist()
                         done+=1; self.state=self.robot.read().tolist(); self.observed_at=time.monotonic()
-                        if self.dagger.active:
-                            until=time.monotonic()+1/self.config['control']['fps']
-                            while time.monotonic()<until:self.tick();time.sleep(.005)
-                        else:time.sleep(1/self.config['control']['fps'])
-                self.result=dict(motion=motion,steps=done,shape=list(actions.shape),round_trip_ms=round(age*1000,1),violations=all_violations)
-                self.event('运动完成' if motion else '无运动推理完成', result=self.result, violations=all_violations)
+                    client.wait_policy_frame(count,chunk_started,self.config,self.tick)
+                self.result=dict(motion=motion,steps=done,actions_per_chunk=count,shape=list(actions.shape),round_trip_ms=round(age*1000,1),violations=all_violations)
+                self.event('动作块完成' if motion else '无运动推理完成', result=self.result, violations=all_violations)
+                if request_trace:
+                    self.event('SDK 动作请求记录',requests=request_trace)
+                    if self.dagger.active:self.dagger.recorder.send('event',{'timestamp':time.monotonic(),'phase':'command_requests','requests':request_trace})
+                    request_trace=[]
+                if not motion:break
             self.check_stop()
             if motion:
                 if self.dagger.active:self.dagger.transition('paused','VLA 步数完成')
@@ -599,12 +836,13 @@ class Manager:
                         hold_source=self.hold_source if self.mode=='holding' else None,
                         hold_elapsed_s=round(time.monotonic()-self.hold_started_at,1) if self.mode=='holding' and self.hold_started_at is not None else None,
                         busy=self.busy,detached=self.detached,latched=self.latched,error=self.error,state=self.state,
-                        exit_pending=self.exit_pending,camera_failed=self.camera_failed,
+                        exit_pending=self.exit_pending,camera_failed=self.camera_failed,repair=self.repair_status,release=self.release_status,
+                        gripper_feedback=self.gripper_feedback,
                         dagger=self.dagger.snapshot(),replay=self.replay.snapshot(),
                         local_server=self.local_server.snapshot(), server_stop_pending=self.server_stop_request is not None,
                         tick_gap_max_ms=round(self.tick_gap_max_s*1000,3),camera_processing_ms=self.camera_processing_ms,
                         age_s=round(time.monotonic()-self.observed_at,2) if self.state else None,
-                        limits=self.config['safety'],server=self.config['server']['url'],prompt=self.config['control']['prompt'],
+                        limits=self.config['safety'],server=self.config['server']['url'],prompt=self.local_server.snapshot().get('default_prompt',''),
                         events=list(self.events)[-40:],result=self.result,log=str(self.logpath))
 
 class Handler(BaseHTTPRequestHandler):
@@ -618,6 +856,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.valid_host(): return self.send({'error':'Host denied'},403)
         path=urlparse(self.path).path
+        if path=='/api/device-ownership':
+            return self.send(device_release.ownership(self.server.manager, ARM_CONTROL_LOCK))
         if path=='/api/state':return self.send(self.server.manager.snapshot())
         if path=='/api/session':return self.send({'token':self.server.token})
         if path=='/api/dagger/folders':

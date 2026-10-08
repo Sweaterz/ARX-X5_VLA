@@ -1,7 +1,7 @@
 import unittest,tempfile,time,json,subprocess
 from pathlib import Path
 import numpy as np
-from dagger_segments import inventory,select_parts
+from dagger_segments import human_motion_trim_ranges,inventory,select_parts
 from dagger_data import Recorder,ROOT,DATA_PYTHON,worker_env
 from test_dagger import metadata,frame
 
@@ -27,9 +27,39 @@ class SelectionTests(unittest.TestCase):
    with self.assertRaises(ValueError):select_parts(self.t,self.labels,self.seg,opts)
  def test_stationary_is_not_automatically_removed(self):
   self.assertEqual(len(select_parts(self.t,self.labels,self.seg,{'mode':'full'})),3)
+ def test_gripper_only_human_demo_is_preserved_without_opt_in_trim(self):
+  q=np.zeros((30,14),dtype=np.float32);q[:,6]=np.linspace(-3,-1,30);q[:,13]=np.linspace(-2,-.2,30)
+  labels=np.ones(30,dtype=int);segments=np.ones(30,dtype=int)
+  ranges,_,resolved=human_motion_trim_ranges(q,self.t,labels,segments,False)
+  self.assertEqual(ranges,[]);self.assertIsNone(resolved)
+  self.assertEqual(len(select_parts(self.t,labels,segments,{'mode':'human','excluded_ranges':ranges})[0]),30)
  def test_exclude_whole_segment(self):
   ids=[x['id'] for x in inventory(self.t,self.labels,self.seg)]
   self.assertEqual(len(select_parts(self.t,self.labels,self.seg,{'mode':'full','excluded_segments':[ids[0]]})),2)
+ def test_human_motion_trim_excludes_only_leading_stationary_frames(self):
+  q=np.zeros((30,14),dtype=np.float32)
+  q[15:,0]=np.linspace(.009,.03,15)
+  ranges,report,config=human_motion_trim_ranges(q,self.t,self.labels,self.seg,True)
+  self.assertEqual(ranges,[[10,14]])
+  self.assertEqual(report[0]['motion_start_frame'],15)
+  self.assertEqual(report[0]['retained_start_frame'],15)
+  self.assertEqual(report[0]['excluded_frames'],5)
+  self.assertEqual(config['displacement_threshold_rad'],.008)
+ def test_human_motion_trim_ignores_jitter_and_drops_no_motion_segment(self):
+  q=np.zeros((30,14),dtype=np.float32)
+  q[10:20,0]=np.tile([0,.002],5)
+  ranges,report,_=human_motion_trim_ranges(q,self.t,self.labels,self.seg,True)
+  self.assertEqual(ranges,[[10,19]])
+  self.assertEqual(report[0]['status'],'no_motion_dropped')
+ def test_human_motion_trim_can_keep_preroll_and_no_motion(self):
+  q=np.zeros((30,14),dtype=np.float32);q[14:,7]=.02
+  ranges,report,_=human_motion_trim_ranges(q,self.t,self.labels,self.seg,{'pre_roll_frames':2,'drop_if_no_motion':False})
+  self.assertEqual(ranges,[[10,11]])
+  self.assertEqual(report[0]['retained_start_frame'],12)
+ def test_human_motion_trim_rejects_invalid_config(self):
+  q=np.zeros((30,14),dtype=np.float32)
+  for config in ['yes',{'unknown':1},{'displacement_threshold_rad':0},{'consecutive_frames':True},{'drop_if_no_motion':1}]:
+   with self.assertRaises(ValueError):human_motion_trim_ranges(q,self.t,self.labels,self.seg,config)
 
 class RealExportTests(unittest.TestCase):
  def test_full_and_selected_lerobot_preserve_labels_and_cuts(self):

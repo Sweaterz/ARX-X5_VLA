@@ -40,7 +40,7 @@ def catalog(root=DATA_ROOT):
                 m=json.loads(path.read_text());m['recoverable']=category=='incomplete'
                 records.append({k:m.get(k) for k in ('episode','created','status','prompt','checkpoint_name','frames','human_frames','result','recoverable','error')})
             except (OSError,ValueError):pass
-    return sorted(records,key=lambda x:x.get('created',0),reverse=True)[:100]
+    return sorted(records,key=lambda x:x.get('created',0),reverse=True)
 
 
 class Recorder:

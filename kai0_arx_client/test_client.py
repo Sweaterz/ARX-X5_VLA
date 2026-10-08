@@ -8,12 +8,18 @@ import os
 import time
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 import numpy as np
 from websockets.sync.server import serve
 import client
 from vendor import msgpack_numpy
 
 C = json.loads((client.ROOT / 'config.json').read_text())
+# FakeArm does not parse URDF; make its path check independent of deployment files.
+_FAKE_PAYLOAD_DIR=tempfile.TemporaryDirectory(prefix='arx-sdk-test-')
+_FAKE_PAYLOAD=Path(_FAKE_PAYLOAD_DIR.name)/'fake_payload.urdf'
+_FAKE_PAYLOAD.write_text('<robot name="mock"/>')
+C['robot']['urdf_path']=str(_FAKE_PAYLOAD)
 
 
 class FakeArm:
@@ -36,6 +42,15 @@ class FakeArm:
 
     def get_joint_positions(self):
         return self.q.copy()
+
+    def get_gripper_pos(self):
+        return float(self.q[6])
+
+    def get_gripper_vel(self):
+        return -.12
+
+    def get_gripper_current(self):
+        return .34
 
     def set_motion_smoothness(self, **kw):
         self.smoothness = kw; return kw
@@ -90,6 +105,17 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(r.arms[0].duration, 0)
             self.assertFalse(hasattr(r.arms[0], 'smoothness'))
         finally: r.close()
+
+    def test_gripper_feedback_is_read_only(self):
+        r = client.SDKRobot(C, FakeArm)
+        try:
+            feedback=r.read_gripper_feedback()
+            self.assertEqual([x['role'] for x in feedback],['left','right'])
+            self.assertEqual([x['position'] for x in feedback],[-.5,-.5])
+            self.assertEqual([x['velocity'] for x in feedback],[-.12,-.12])
+            self.assertEqual([x['current'] for x in feedback],[.34,.34])
+            self.assertTrue(all(not a.targets and not hasattr(a,'gripper_request') for a in r.arms))
+        finally:r.close()
 
     def test_invalid_request_never_reaches_sdk(self):
         r = client.SDKRobot(C, FakeArm)

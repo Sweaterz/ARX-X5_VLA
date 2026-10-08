@@ -35,3 +35,18 @@ audits/
 !package-lock.json
 CHECKPOINT_VERIFIED.json
 .CHECKPOINT_VERIFIED.tmp
+
+# Copied deployment backups, archives and machine settings
+*.orig
+*.before-*
+*.bak
+*.zip
+dist.*/
+backups/
+dagger_settings.json
+start_gui.txt
+apply_checkpoint_steps_update.py
+apply_takeover_delay.py
+raw_cleaned/
+exports/
+incomplete/

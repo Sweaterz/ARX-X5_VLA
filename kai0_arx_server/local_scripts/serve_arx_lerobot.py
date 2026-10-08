@@ -19,6 +19,15 @@ ACTION_NAMES = [*(f'left_joint_{i}' for i in range(1, 7)), 'left_gripper',
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def execution_profile(path,config):
+    # Original fold deployment: --n-action-steps=50; short replans repeat its hold prefix.
+    try:training=json.loads((path/'train_config.json').read_text())
+    except (OSError,ValueError):training={}
+    if training.get('dataset',{}).get('repo_id')=='local/fold_box_v1_pi05':
+        return min(50,config.chunk_size),'fold original deployment (50 ordered actions)'
+    return min(8,config.chunk_size),'existing client default (8 ordered actions)'
+
+
 def checkpoint_info(path):
     config = json.loads((path / 'config.json').read_text())
     if config['type'] != 'pi05' or config['use_relative_actions']:
@@ -107,12 +116,14 @@ class CheckpointPolicy:
         del weights
         self.policy.eval()
         torch.cuda.synchronize()
+        execution_steps,execution_source=execution_profile(path,config)
         self.metadata = {
             'service': 'kai0-arx-lerobot-pi05', 'mode': 'checkpoint', 'test_only': False,
             'motion_enabled': True, 'hardware_validated': False,
             'checkpoint': str(path), 'checkpoint_step': path.parent.name,
             'checkpoint_config_sha256': hashlib.sha256((path / 'config.json').read_bytes()).hexdigest(),
             'policy_type': 'pi05', 'action_dim': 14, 'action_horizon': config.chunk_size,
+            'recommended_actions_per_chunk':execution_steps,'execution_profile':execution_source,
             'action_names': ACTION_NAMES, 'action_semantics': 'absolute SDK joint angles; left then right',
             'default_prompt': prompt, 'input_profile': 'state[14], images{top_head,hand_left,hand_right}, prompt',
             'checkpoint_cameras': list(CAMERAS.values()), 'weights_strictly_loaded': self.weight_count,

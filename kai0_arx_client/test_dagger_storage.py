@@ -1,6 +1,7 @@
 import tempfile,threading,json,unittest
 from pathlib import Path
 from unittest.mock import patch,Mock
+from dagger_data import catalog
 from dagger_runtime import Dagger
 import dagger_runtime
 class StorageTests(unittest.TestCase):
@@ -30,3 +31,11 @@ class StorageTests(unittest.TestCase):
   bad=self.root/'file';bad.write_text('x');old=self.d.root
   with self.assertRaises(OSError):self.d.configure_storage(str(bad))
   self.assertEqual(self.d.root,old)
+ def test_catalog_returns_more_than_one_hundred_episodes(self):
+  episodes=self.root/'episodes';episodes.mkdir()
+  for index in range(102):
+   path=episodes/f'ep_{index}_{index:08x}';path.mkdir()
+   (path/'manifest.json').write_text(json.dumps({'episode':path.name,'created':index,'status':'saved'}))
+  records=catalog(self.root)
+  self.assertEqual(len(records),102)
+  self.assertEqual(records[0]['created'],101)

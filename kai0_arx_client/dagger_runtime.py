@@ -74,7 +74,8 @@ class Dagger:
             'feedback_time_basis':'host SDK read completion; no per-motor receive timestamp exposed',
             'camera_config':config['cameras'],'sdk_motion_configuration':json.loads(json.dumps(getattr(manager.robot,'sdk_motion_limits',None),default=lambda x:x.tolist() if hasattr(x,'tolist') else str(x))),'action_names':[f'{side}_{joint}' for side in ('left','right') for joint in ('joint_1','joint_2','joint_3','joint_4','joint_5','joint_6','gripper')],
             'urdf_sha256':hashlib.sha256(urdf.read_bytes()).hexdigest() if urdf.is_file() else None,
-            'demo':manager.demo,'steps':data['steps'],'server':config['server']['url']}
+            'demo':manager.demo,'steps':data['steps'],'chunk_steps':data.get('chunk_steps',0),
+            'server':config['server']['url']}
         cp=Path(checkpoint)/'config.json'
         if cp.is_file():self.metadata['checkpoint_sha256']=hashlib.sha256(cp.read_bytes()).hexdigest()
         self.recorder=Recorder(self.metadata,self.root);self.started=time.monotonic();self.ended=0.;self.accepted=self.human=0
