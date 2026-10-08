@@ -2,6 +2,10 @@
 
 ARX X5-2025 双臂 VLA 客户端、GUI 和 LeRobot PI05 推理服务。此仓库是 `.136` 部署源码快照，不是 Kai0 官方完整仓库，也不包含官方 ARX SDK 或模型权重。
 
+![DAgger 采集操作界面](docs/images/dagger-ui.png)
+
+DAgger 演示界面：三路相机观察、人工接管、暂停保持与试验保存；相机画面来自已保存记录。
+
 ## 功能
 
 - GUI：设备连接、双臂归位、VLA 执行、暂停保持、软件紧急停止、Server 管理。
